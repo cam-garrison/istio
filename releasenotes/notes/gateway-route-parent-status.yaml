@@ -1,0 +1,10 @@
+area: traffic-management
+issue:
+  - 58840
+releaseNotes:
+  - |
+    **Fixed** Gateway API Route status ownership to follow each parent Gateway's
+    revision, including parents referenced through ListenerSets. Routes no longer
+    need a matching revision label to receive status updates, and revisions that
+    own different parents preserve each other's status entries.
+    This applies to Envoy gateways and AgentGateway gateways and waypoints.

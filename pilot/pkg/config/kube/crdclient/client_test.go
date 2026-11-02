@@ -23,6 +23,7 @@ import (
 
 	"go.uber.org/atomic"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gw "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/gateway-api/pkg/consts"
 
 	"istio.io/api/meta/v1alpha1"
@@ -374,6 +375,27 @@ func TestClientInitialSyncSkipsOtherRevisions(t *testing.T) {
 		tt.WaitUnordered(slices.Map(expected, func(c config.Config) string {
 			return fmt.Sprintf("add/%v/%v", c.GroupVersionKind.Kind, krt.GetKey(c))
 		})...)
+	}
+}
+
+func TestRouteStatusStoreSeesOtherRevisions(t *testing.T) {
+	fake := kube.NewFakeClient()
+	for _, s := range []resource.Schema{collections.HTTPRoute, collections.GRPCRoute, collections.TCPRoute, collections.TLSRoute, collections.ListenerSet} {
+		clienttest.MakeCRDWithAnnotations(t, fake, s.GroupVersionResource(), map[string]string{consts.BundleVersionAnnotation: consts.BundleVersion})
+	}
+	meta := metav1.ObjectMeta{Name: "other", Namespace: "ns", Labels: map[string]string{"istio.io/rev": "canary"}}
+	clienttest.NewWriter[*gw.HTTPRoute](t, fake).Create(&gw.HTTPRoute{ObjectMeta: meta})
+	clienttest.NewWriter[*gw.GRPCRoute](t, fake).Create(&gw.GRPCRoute{ObjectMeta: meta})
+	clienttest.NewWriter[*gw.TCPRoute](t, fake).Create(&gw.TCPRoute{ObjectMeta: meta})
+	clienttest.NewWriter[*gw.TLSRoute](t, fake).Create(&gw.TLSRoute{ObjectMeta: meta})
+	clienttest.NewWriter[*gw.ListenerSet](t, fake).Create(&gw.ListenerSet{ObjectMeta: meta})
+	store := New(fake, Option{Revision: "stable"})
+	stop := test.NewStop(t)
+	fake.RunAndWait(stop)
+	go store.Run(stop)
+	kube.WaitForCacheSync("test", stop, store.HasSynced)
+	for _, kind := range []config.GroupVersionKind{gvk.HTTPRoute, gvk.GRPCRoute, gvk.TCPRoute, gvk.TLSRoute, gvk.ListenerSet} {
+		assert.EventuallyEqual(t, func() bool { return store.Get(kind, "other", "ns") != nil }, true)
 	}
 }
 

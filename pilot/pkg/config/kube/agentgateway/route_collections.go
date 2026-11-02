@@ -35,7 +35,6 @@ import (
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/ptr"
-	"istio.io/istio/pkg/revisions"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
@@ -137,7 +136,7 @@ func AgwRouteCollection(
 	tcpRouteCol krt.Collection[*gatewayv1.TCPRoute],
 	tlsRouteCol krt.Collection[*gatewayv1.TLSRoute],
 	inputs RouteContextInputs,
-	tagWatcher krt.RecomputeProtected[revisions.TagWatcher],
+	owners gatewaycommon.RouteStatusOwners,
 	krtopts krt.OptionsBuilder,
 ) (krt.Collection[AgwResource], krt.Collection[*RouteAttachment]) {
 	// Create httpRoutes collection
@@ -165,7 +164,7 @@ func AgwRouteCollection(
 		}, func(status gatewayv1.RouteStatus) gatewayv1.HTTPRouteStatus {
 			return gatewayv1.HTTPRouteStatus{RouteStatus: status}
 		})
-	status.RegisterStatus(queue, httpRouteStatus, GetStatus, tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(queue, httpRouteStatus, GetStatus, owners, krtopts)
 
 	// Create gRPCRoutes collection
 	grpcRouteStatus, grpcRoutes := createRouteCollection(grpcRouteCol, inputs, krtopts, "GRPCRoutes",
@@ -183,7 +182,7 @@ func AgwRouteCollection(
 		}, func(status gatewayv1.RouteStatus) gatewayv1.GRPCRouteStatus {
 			return gatewayv1.GRPCRouteStatus{RouteStatus: status}
 		})
-	status.RegisterStatus(queue, grpcRouteStatus, GetStatus, tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(queue, grpcRouteStatus, GetStatus, owners, krtopts)
 
 	// Create TCPRoutes collection
 	tcpRouteStatus, tcpRoutes := createTCPRouteCollection(tcpRouteCol, inputs, krtopts, "TCPRoutes",
@@ -201,7 +200,7 @@ func AgwRouteCollection(
 		}, func(status gatewayv1.RouteStatus) gatewayv1.TCPRouteStatus {
 			return gatewayv1.TCPRouteStatus{RouteStatus: status}
 		})
-	status.RegisterStatus(queue, tcpRouteStatus, GetStatus, tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(queue, tcpRouteStatus, GetStatus, owners, krtopts)
 
 	// Create TLSRoutes collection
 	tlsRouteStatus, tlsRoutes := createTCPRouteCollection(tlsRouteCol, inputs, krtopts, "TLSRoutes",
@@ -219,7 +218,7 @@ func AgwRouteCollection(
 		}, func(status gatewayv1.RouteStatus) gatewayv1.TLSRouteStatus {
 			return gatewayv1.TLSRouteStatus{RouteStatus: status}
 		})
-	status.RegisterStatus(queue, tlsRouteStatus, GetStatus, tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(queue, tlsRouteStatus, GetStatus, owners, krtopts)
 
 	// Join all the route types into a single collection
 	routes := krt.JoinCollection([]krt.Collection[AgwResource]{httpRoutes, grpcRoutes, tcpRoutes, tlsRoutes}, krtopts.WithName("ADPRoutes")...)

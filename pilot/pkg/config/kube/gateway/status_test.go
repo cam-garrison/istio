@@ -23,10 +23,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	gw "sigs.k8s.io/gateway-api/apis/v1"
 
+	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/networking/core"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pilot/pkg/status"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/slices"
@@ -135,4 +137,46 @@ func TestMergeLivePolicyStatus(t *testing.T) {
 	}}))
 	// Live status must not be mutated.
 	assert.Equal(t, live.Ancestors[0], ancestor("svc", mesh, 1))
+}
+
+func TestRouteStatusFollowsGatewayRevision(t *testing.T) {
+	for _, routeRevision := range []string{"", "stable"} {
+		t.Run("route-revision="+routeRevision, func(t *testing.T) {
+			route := &gw.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns1", Generation: 1},
+				Spec:       *httpRouteSpec,
+			}
+			route.Spec.Rules = []gw.HTTPRouteRule{{Filters: []gw.HTTPRouteFilter{{
+				Type: gw.HTTPRouteFilterRequestRedirect, RequestRedirect: &gw.HTTPRequestRedirectFilter{},
+			}}}}
+			if routeRevision != "" {
+				route.Labels = map[string]string{label.IoIstioRev.Name: routeRevision}
+			}
+			for _, revision := range []string{"canary", "stable"} {
+				t.Run(revision, func(t *testing.T) {
+					c := setupControllerWithRevision(t, revision,
+						&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns1"}},
+						&gw.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "gwclass"}, Spec: *gatewayClassSpec},
+						&gw.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gwspec", Namespace: "ns1",
+							Labels: map[string]string{label.IoIstioRev.Name: "canary"}}, Spec: *gatewaySpec}, route)
+					q := &TestStatusQueue{state: map[status.Resource]any{}}
+					setAndWait(t, c, q)
+					var parents []gw.RouteParentStatus
+					for _, s := range q.Statuses() {
+						if s, ok := s.(*gw.HTTPRouteStatus); ok {
+							parents = s.Parents
+						}
+					}
+					if revision == "canary" {
+						assert.Equal(t, len(parents), 1)
+						assert.Equal(t, parents[0].Conditions[0].ObservedGeneration, int64(1))
+					} else {
+						assert.Equal(t, len(parents), 0)
+					}
+					// Both revisions still emit the Route, including when its label differs.
+					assert.Equal(t, len(c.List(gvk.VirtualService, "ns1")), 1)
+				})
+			}
+		})
+	}
 }

@@ -400,7 +400,9 @@ func (cl *Client) addCRD(name string, opts krt.OptionsBuilder) {
 		ObjectTransform: transform,
 		FieldSelector:   fieldSelector,
 	}
-	if resourceGVK == gvk.KubernetesGateway {
+	// The status manager must see attached resources regardless of their own revision labels.
+	switch resourceGVK {
+	case gvk.KubernetesGateway, gvk.ListenerSet, gvk.HTTPRoute, gvk.GRPCRoute, gvk.TCPRoute, gvk.TLSRoute:
 		filter.ObjectFilter = kubetypes.ComposeFilters(namespaceFilter, extraFilter)
 	}
 

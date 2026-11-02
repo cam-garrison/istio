@@ -320,6 +320,10 @@ func NewController(
 	}
 
 	RouteParents := BuildRouteParents(Gateways)
+	routeOwners := gatewaycommon.RouteStatusOwners{
+		Gateways: inputs.Gateways, ListenerSets: inputs.ListenerSets, Namespaces: inputs.Namespaces,
+		TagWatcher: c.tagWatcher, Controllers: sets.New(gatewayv1.GatewayController(features.ManagedGatewayController)),
+	}
 
 	routeInputs := RouteContextInputs{
 		Grants:          ReferenceGrants,
@@ -340,25 +344,25 @@ func NewController(
 		routeInputs,
 		opts,
 	)
-	status.RegisterStatus(c.status, tcpRoutes.Status, GetStatus, c.tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(c.status, tcpRoutes.Status, GetStatus, routeOwners, opts)
 	tlsRoutes := TLSRouteCollection(
 		inputs.TLSRoutes,
 		routeInputs,
 		opts,
 	)
-	status.RegisterStatus(c.status, tlsRoutes.Status, GetStatus, c.tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(c.status, tlsRoutes.Status, GetStatus, routeOwners, opts)
 	httpRoutes := HTTPRouteCollection(
 		inputs.HTTPRoutes,
 		routeInputs,
 		opts,
 	)
-	status.RegisterStatus(c.status, httpRoutes.Status, GetStatus, c.tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(c.status, httpRoutes.Status, GetStatus, routeOwners, opts)
 	grpcRoutes := GRPCRouteCollection(
 		inputs.GRPCRoutes,
 		routeInputs,
 		opts,
 	)
-	status.RegisterStatus(c.status, grpcRoutes.Status, GetStatus, c.tagWatcher.AccessUnprotected())
+	gatewaycommon.RegisterRouteStatus(c.status, grpcRoutes.Status, GetStatus, routeOwners, opts)
 
 	RouteAttachments := krt.JoinCollection([]krt.Collection[RouteAttachment]{
 		tcpRoutes.RouteAttachments,
@@ -502,8 +506,9 @@ func buildClient[I controllers.ComparableObject](
 		ObjectFilter: kubetypes.ComposeFilters(kc.ObjectFilter(), c.inRevision),
 	}
 
-	// all other types are filtered by revision, but for gateways we need to select tags as well
-	if res == gvr.KubernetesGateway {
+	// Attached resources must remain visible when their Gateway changes revision.
+	switch res {
+	case gvr.KubernetesGateway, gvr.ListenerSet, gvr.HTTPRoute, gvr.GRPCRoute, gvr.TCPRoute, gvr.TLSRoute:
 		filter.ObjectFilter = kc.ObjectFilter()
 	}
 
@@ -539,7 +544,7 @@ func (c *Controller) List(typ config.GroupVersionKind, namespace string) []confi
 func (c *Controller) SetStatusWrite(enabled bool, statusManager *status.Manager) {
 	if enabled && features.EnableGatewayAPIStatus && statusManager != nil {
 		var q status.Queue = statusManager.CreateGenericController(func(status status.Manipulator, context any) {
-			status.SetInner(mergeLivePolicyStatus(status.Unwrap(), context))
+			status.SetInner(gatewaycommon.MergeRouteStatus(status.Unwrap(), mergeLivePolicyStatus(status.Unwrap(), context)))
 		})
 		c.status.SetQueue(q)
 	} else {
