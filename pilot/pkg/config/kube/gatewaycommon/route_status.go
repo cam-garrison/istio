@@ -162,7 +162,7 @@ func routeParents(s any) []gw.RouteParentStatus {
 }
 
 // MergeRouteStatus uses the status manager's latest snapshot. UpdateStatus carries its resourceVersion,
-// so concurrent writers conflict instead of overwriting each other; informer events reconcile the loser.
+// so concurrent writers conflict instead of overwriting each other; the manager retries with a fresh snapshot.
 func MergeRouteStatus(live, desired any) any {
 	u, ok := desired.(RouteStatusUpdate)
 	if !ok {

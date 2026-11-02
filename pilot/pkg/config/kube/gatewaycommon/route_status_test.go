@@ -419,3 +419,82 @@ func TestRouteStatusConflictConverges(t *testing.T) {
 	assert.Equal(t, store.current.Status.(*gw.HTTPRouteStatus).Parents[0].Conditions[0].ObservedGeneration, int64(1))
 	assert.Equal(t, store.current.Status.(*gw.HTTPRouteStatus).Parents[1].Conditions[0].ObservedGeneration, int64(1))
 }
+
+// delayedRouteStore holds the writer's cache behind the Route collection until its first conflict.
+type delayedRouteStore struct {
+	*conflictRouteStore
+	cached config.Config
+}
+
+func (s *delayedRouteStore) Get(config.GroupVersionKind, string, string) *config.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.cached.DeepCopy()
+	return &out
+}
+
+func (s *delayedRouteStore) UpdateStatus(cfg config.Config) (string, error) {
+	version, err := s.conflictRouteStore.UpdateStatus(cfg)
+	if kerrors.IsConflict(err) {
+		s.mu.Lock()
+		s.cached = s.current.DeepCopy()
+		s.mu.Unlock()
+	}
+	return version, err
+}
+
+func TestRouteStatusConflictWithDelayedWriterCache(t *testing.T) {
+	stop := test.NewStop(t)
+	opts := krt.NewOptionsBuilder(stop, "delayed-cache", nil)
+	controller := gw.GatewayController("istio.io/gateway-controller")
+	var gateways []*gw.Gateway
+	var parents []gw.RouteParentStatus
+	for _, rev := range []string{"red", "blue"} {
+		gateways = append(gateways, &gw.Gateway{ObjectMeta: metav1.ObjectMeta{Name: rev, Namespace: "ns",
+			Labels: map[string]string{label.IoIstioRev.Name: rev}}})
+		parents = append(parents, gw.RouteParentStatus{ParentRef: gw.ParentReference{Name: gw.ObjectName(rev)}, ControllerName: controller,
+			Conditions: []metav1.Condition{{Type: "Accepted", Status: metav1.ConditionTrue, ObservedGeneration: 1}}})
+	}
+	stale := config.Config{
+		Meta:   config.Meta{GroupVersionKind: gvk.HTTPRoute, Name: "route", Namespace: "ns", Generation: 1, ResourceVersion: "1"},
+		Status: &gw.HTTPRouteStatus{},
+	}
+	live := stale.DeepCopy()
+	live.ResourceVersion = "2"
+	live.Status = &gw.HTTPRouteStatus{RouteStatus: gw.RouteStatus{Parents: parents[:1]}}
+	store := &delayedRouteStore{
+		conflictRouteStore: &conflictRouteStore{current: live, notify: func(config.Config) {}},
+		cached:             stale,
+	}
+	owners := RouteStatusOwners{
+		Gateways:     krt.NewStaticCollection(nil, gateways, opts.WithName("gateways")...),
+		ListenerSets: krt.NewStaticCollection[*gw.ListenerSet](nil, nil, opts.WithName("sets")...),
+		Namespaces:   krt.NewStaticCollection[*corev1.Namespace](nil, nil, opts.WithName("namespaces")...),
+		TagWatcher:   krt.NewRecomputeProtected[revisions.TagWatcher](&routeStatusTagWatcher{revision: "blue"}, true, opts.WithName("tags")...),
+		Controllers:  sets.New(controller),
+	}
+	type entry = krt.ObjectWithStatus[*gw.HTTPRoute, gw.HTTPRouteStatus]
+	// The Route collection has already received revision red's write. There are no subsequent input events or edits.
+	input := krt.NewStaticCollection(nil, []entry{{
+		Obj: &gw.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: live.Name, Namespace: live.Namespace,
+			Generation: live.Generation, ResourceVersion: live.ResourceVersion}, Status: *live.Status.(*gw.HTTPRouteStatus).DeepCopy()},
+		Status: gw.HTTPRouteStatus{RouteStatus: gw.RouteStatus{Parents: parents}},
+	}}, opts.WithName("routes")...)
+	registrations := &status.StatusCollections{}
+	RegisterRouteStatus(registrations, input, func(r *gw.HTTPRoute) gw.HTTPRouteStatus { return r.Status }, owners, opts)
+	manager := status.NewManager(store)
+	manager.Start(stop)
+	registrations.SetQueue(manager.CreateGenericController(func(s status.Manipulator, desired any) {
+		s.SetInner(MergeRouteStatus(s.Unwrap(), desired))
+	}))
+	assert.EventuallyEqual(t, func() []gw.RouteParentStatus {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.current.Status.(*gw.HTTPRouteStatus).DeepCopy().Parents
+	}, parents)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Equal(t, store.conflicts, 1)
+	assert.Equal(t, store.current.ResourceVersion, "3")
+	assert.Equal(t, store.current.Generation, int64(1))
+}

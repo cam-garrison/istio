@@ -16,16 +16,20 @@ package status
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"istio.io/api/meta/v1alpha1"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -37,9 +41,10 @@ func TestLockLoop(t *testing.T) {
 	}
 	allowWork := make(chan struct{})
 	c1 := mgr.CreateIstioStatusController(fakefunc)
-	wp := NewWorkerPool(func(c *config.Config) {
+	wp := NewWorkerPool(func(c *config.Config) error {
 		g <- struct{}{}
 		<-allowWork
+		return nil
 	}, func(resource Resource) *config.Config {
 		return &config.Config{
 			Meta: config.Meta{Generation: 11},
@@ -78,6 +83,12 @@ func TestLockLoop(t *testing.T) {
 	// And should complete once we unblock the work
 	close(allowWork)
 	<-g
+	pool := wp.(*WorkerPool)
+	assert.EventuallyEqual(t, func() uint {
+		pool.lock.Lock()
+		defer pool.lock.Unlock()
+		return pool.workerCount
+	}, 0)
 }
 
 func TestResourceLock_Lock(t *testing.T) {
@@ -111,7 +122,8 @@ func TestResourceLock_Lock(t *testing.T) {
 	}
 	c1 := mgr.CreateIstioStatusController(fakefunc)
 	c2 := mgr.CreateIstioStatusController(fakefunc)
-	workers := NewWorkerPool(func(_ *config.Config) {
+	workers := NewWorkerPool(func(_ *config.Config) error {
+		return nil
 	}, func(resource Resource) *config.Config {
 		// The live object is at whatever generation was last observed and pushed.
 		gen, _ := strconv.ParseInt(resource.Generation, 10, 64)
@@ -176,8 +188,9 @@ func TestWorkerPoolSkipsStaleGeneration(t *testing.T) {
 	wrote := make(chan struct{}, 1)
 	mgr := NewManager(nil)
 	c := mgr.CreateIstioStatusController(func(status Manipulator, context any) {})
-	workers := NewWorkerPool(func(_ *config.Config) {
+	workers := NewWorkerPool(func(_ *config.Config) error {
 		wrote <- struct{}{}
+		return nil
 	}, func(_ Resource) *config.Config {
 		// live object has moved on
 		return &config.Config{Meta: config.Meta{Generation: 12}}
@@ -195,4 +208,52 @@ func TestWorkerPoolSkipsStaleGeneration(t *testing.T) {
 	workers.Push(stale, c, nil)
 
 	g.Consistently(wrote, 100*time.Millisecond).ShouldNot(Receive())
+}
+
+func TestWorkerPoolStopsConflictRetry(t *testing.T) {
+	conflict := kerrors.NewConflict(schema.GroupResource{Resource: "httproutes"}, "route", errors.New("stale resourceVersion"))
+	for _, tt := range []struct {
+		name   string
+		err    error
+		next   *config.Config
+		cancel bool
+		reads  int32
+	}{
+		{name: "deleted", err: conflict, reads: 2},
+		{name: "newer generation", err: conflict, next: &config.Config{Meta: config.Meta{Generation: 12}}, reads: 2},
+		{name: "non-conflict error", err: errors.New("write failed"), reads: 1},
+		{name: "shutdown", err: conflict, cancel: true, reads: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var reads, writes atomic.Int32
+			cached := &config.Config{Meta: config.Meta{Generation: 11}, Status: &v1alpha1.IstioStatus{}}
+			workers := NewWorkerPool(func(*config.Config) error {
+				writes.Add(1)
+				if tt.cancel {
+					cancel()
+				}
+				return tt.err
+			}, func(Resource) *config.Config {
+				if reads.Add(1) == 1 {
+					return cached
+				}
+				return tt.next
+			}, 1)
+			workers.Run(ctx)
+			workers.Push(Resource{Name: "route", Generation: "11"}, &Controller{fn: func(Manipulator, any) {}}, nil)
+			assert.EventuallyEqual(t, writes.Load, 1)
+			pool := workers.(*WorkerPool)
+			assert.EventuallyEqual(t, func() uint {
+				pool.lock.Lock()
+				defer pool.lock.Unlock()
+				return pool.workerCount
+			}, 0)
+			assert.Equal(t, reads.Load(), tt.reads)
+			assert.Equal(t, writes.Load(), 1)
+			// Failed writes must not mutate the cached status and hide the need to retry.
+			assert.Equal(t, cached.Status.(*v1alpha1.IstioStatus).ObservedGeneration, int64(0))
+		})
+	}
 }
