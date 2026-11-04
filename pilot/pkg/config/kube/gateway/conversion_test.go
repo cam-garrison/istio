@@ -669,6 +669,9 @@ type TestStatusQueue struct {
 func (t *TestStatusQueue) EnqueueStatusUpdateResource(context any, target status.Resource) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if update, ok := context.(gatewaycommon.RouteStatusUpdate); ok {
+		context = gatewaycommon.MergeRouteStatus(update.Status, update)
+	}
 	t.state[target] = context
 }
 

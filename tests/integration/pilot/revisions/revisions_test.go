@@ -23,7 +23,10 @@ import (
 	"time"
 
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kuberetry "k8s.io/client-go/util/retry"
+	gw "sigs.k8s.io/gateway-api/apis/v1"
 
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/crd"
@@ -240,4 +243,176 @@ spec:
 				return nil
 			}, retry.Converge(10), retry.Delay(10*time.Millisecond))
 		})
+}
+
+func TestRouteStatusWithParentsInDifferentRevisions(t *testing.T) {
+	framework.NewTest(t).Run(func(t framework.TestContext) {
+		crd.DeployGatewayAPIOrSkip(t)
+		cfg := istio.DefaultConfigOrFail(t, t)
+		controller := gw.GatewayController("istio.io/gateway-controller")
+		listenerProtocol, port := "HTTP", "80"
+		parentKinds := []string{"Gateway"}
+		switch cfg.GatewayClassName {
+		case constants.AgentgatewayClassName:
+			controller = constants.ManagedAgentgatewayController
+		case constants.AgentgatewayWaypointClassName:
+			controller = constants.ManagedAgentgatewayWaypointController
+			listenerProtocol, port = "HBONE", "15008"
+			parentKinds = append(parentKinds, "Service")
+		}
+		for _, parentKind := range parentKinds {
+			t.NewSubTest(parentKind).Run(func(t framework.TestContext) {
+				ns := namespace.NewOrFail(t, namespace.Config{Prefix: "route-status", Inject: false})
+				for _, revision := range []string{"stable", "canary"} {
+					t.ConfigIstio().Eval(ns.Name(), map[string]string{
+						"revision": revision, "class": cfg.GatewayClassName, "protocol": listenerProtocol, "port": port,
+					}, `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{.revision}}
+  labels:
+    istio.io/rev: {{.revision}}
+    istio.io/waypoint-for: service
+  annotations:
+    networking.istio.io/service-type: ClusterIP
+spec:
+  gatewayClassName: {{.class}}
+  listeners:
+  - name: http
+    port: {{.port}}
+    protocol: {{.protocol}}
+`).ApplyOrFail(t)
+					if parentKind == "Service" {
+						t.ConfigIstio().Eval(ns.Name(), map[string]string{"revision": revision}, `
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{.revision}}-service
+  labels:
+    istio.io/use-waypoint: {{.revision}}
+spec:
+  ports:
+  - name: http
+    port: 80
+`).ApplyOrFail(t)
+					}
+				}
+				parentGroup := gw.Group(gw.GroupName)
+				stableParent, canaryParent := gw.ObjectName("stable"), gw.ObjectName("canary")
+				if parentKind == "Service" {
+					parentGroup = ""
+					stableParent, canaryParent = "stable-service", "canary-service"
+				}
+				t.ConfigIstio().Eval(ns.Name(), map[string]string{
+					"kind": parentKind, "group": string(parentGroup), "stable": string(stableParent), "canary": string(canaryParent),
+				}, `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shared
+{{if eq .kind "Service"}}
+  labels:
+    istio.io/rev: stable
+{{end}}
+spec:
+  parentRefs:
+  - name: {{.stable}}
+    kind: {{.kind}}
+    group: "{{.group}}"
+  - name: {{.canary}}
+    kind: {{.kind}}
+    group: "{{.group}}"
+  rules:
+  - filters:
+    - type: RequestRedirect
+      requestRedirect:
+        hostname: example.com
+`).ApplyOrFail(t)
+				client := t.Clusters().Default().GatewayAPI().GatewayV1()
+				routes := client.HTTPRoutes(ns.Name())
+				check := func(names ...gw.ObjectName) {
+					t.Helper()
+					var version string
+					retry.UntilSuccessOrFail(t, func() error {
+						route, err := routes.Get(context.Background(), "shared", v1.GetOptions{})
+						if err != nil {
+							return err
+						}
+						if len(route.Status.Parents) != len(names) {
+							return fmt.Errorf("got parents %v, want %v", route.Status.Parents, names)
+						}
+						for _, name := range names {
+							found := false
+							for _, parent := range route.Status.Parents {
+								if parent.ParentRef.Name != name || parent.ControllerName != controller {
+									continue
+								}
+								found = true
+								for _, typ := range []string{"Accepted", "ResolvedRefs"} {
+									valid := false
+									for _, condition := range parent.Conditions {
+										if condition.Type == typ && condition.Status == v1.ConditionTrue && condition.ObservedGeneration == route.Generation {
+											valid = true
+										}
+									}
+									if !valid {
+										return fmt.Errorf("parent %s lacks current %s=True: %v", name, typ, parent.Conditions)
+									}
+								}
+							}
+							if !found {
+								return fmt.Errorf("missing parent %s for controller %s", name, controller)
+							}
+						}
+						if version != route.ResourceVersion {
+							version = route.ResourceVersion
+							return fmt.Errorf("waiting for status writes to settle")
+						}
+						return nil
+					}, retry.Timeout(30*time.Second), retry.Delay(100*time.Millisecond), retry.Converge(20))
+				}
+				check(stableParent, canaryParent)
+				// Transfer a parent, then change the Route generation to require a new status from its new owner.
+				if parentKind == "Gateway" {
+					if err := kuberetry.RetryOnConflict(kuberetry.DefaultRetry, func() error {
+						gateway, err := client.Gateways(ns.Name()).Get(context.Background(), "canary", v1.GetOptions{})
+						if err != nil {
+							return err
+						}
+						gateway.Labels["istio.io/rev"] = "stable"
+						_, err = client.Gateways(ns.Name()).Update(context.Background(), gateway, v1.UpdateOptions{})
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				updateRoute := func(change func(*gw.HTTPRoute)) {
+					t.Helper()
+					if err := kuberetry.RetryOnConflict(kuberetry.DefaultRetry, func() error {
+						route, err := routes.Get(context.Background(), "shared", v1.GetOptions{})
+						if err != nil {
+							return err
+						}
+						change(route)
+						_, err = routes.Update(context.Background(), route, v1.UpdateOptions{})
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				updateRoute(func(route *gw.HTTPRoute) {
+					hostname := gw.PreciseHostname("updated.example.com")
+					route.Spec.Rules[0].Filters[0].RequestRedirect.Hostname = &hostname
+					if parentKind == "Service" {
+						// Service parents retain Route ownership, even across waypoint revisions.
+						route.Labels["istio.io/rev"] = "canary"
+					}
+				})
+				check(stableParent, canaryParent)
+				updateRoute(func(route *gw.HTTPRoute) { route.Spec.ParentRefs = route.Spec.ParentRefs[:1] })
+				check(stableParent)
+			})
+		}
+	})
 }

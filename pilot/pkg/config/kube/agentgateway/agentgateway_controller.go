@@ -588,8 +588,9 @@ func buildClient[I controllers.ComparableObject](
 		ObjectFilter: kubetypes.ComposeFilters(kc.ObjectFilter(), c.inRevision),
 	}
 
-	// all other types are filtered by revision, but for gateways we need to select tags as well
-	if res == gvr.KubernetesGateway {
+	// Attached resources must remain visible when their Gateway changes revision.
+	switch res {
+	case gvr.KubernetesGateway, gvr.ListenerSet, gvr.HTTPRoute, gvr.GRPCRoute, gvr.TCPRoute, gvr.TLSRoute:
 		filter.ObjectFilter = kc.ObjectFilter()
 	}
 
@@ -638,7 +639,7 @@ func updateStatus(s status.Manipulator, desired any) {
 		merged.Ancestors = btlsMergeAncestors(constants.ManagedAgentgatewayController, live.Ancestors, ours)
 		desired = merged
 	}
-	s.SetInner(desired)
+	s.SetInner(gatewaycommon.MergeRouteStatus(s.Unwrap(), desired))
 }
 
 // Reconcile is called each time the `gatewayContext` may change. We use this to mark it as updated.
@@ -774,7 +775,12 @@ func (c *Controller) buildAgwResources(
 		c.inputs.TCPRoutes,
 		c.inputs.TLSRoutes,
 		routeInputs,
-		c.tagWatcher,
+		gatewaycommon.RouteStatusOwners{
+			Gateways: c.inputs.Gateways, ListenerSets: c.inputs.ListenerSets, Namespaces: c.inputs.Namespaces,
+			TagWatcher: c.tagWatcher,
+			Controllers: sets.New[gatewayv1.GatewayController](
+				constants.ManagedAgentgatewayController, constants.ManagedAgentgatewayWaypointController),
+		},
 		opts,
 	)
 
